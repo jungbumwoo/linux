@@ -60,6 +60,37 @@
  * deep; cycles are forbidden and detected at EPOLL_CTL_ADD time.
  *
  *
+ * Code-reading map
+ * ----------------
+ *
+ * The implementation is easier to follow as three mostly independent
+ * paths. The function names below are useful starting points:
+ *
+ *   Control path:
+ *     epoll_create1() -> do_epoll_create() -> ep_alloc()
+ *     epoll_ctl() -> do_epoll_ctl_file() -> ep_insert() / ep_modify() /
+ *                    ep_remove()
+ *
+ *   Notification path (runs in the watched file's wakeup context):
+ *     ep_ptable_queue_proc() installs ep_poll_callback()
+ *     wake_up() -> ep_poll_callback() -> rdllist or ovflist
+ *                                      -> wake ep->wq
+ *
+ *   Wait and delivery path:
+ *     epoll_wait() -> do_epoll_wait() -> ep_poll()
+ *                  -> ep_send_events() -> ep_deliver_event()
+ *
+ * Closing a watched file enters eventpoll_release_file() from __fput();
+ * closing the epoll file itself enters ep_clear_and_put().
+ *
+ * Keep the two indexes conceptually separate while reading the code:
+ * ep->rbr is the interest set used by epoll_ctl() to find a watch,
+ * whereas ep->rdllist is the ready set consumed by epoll_wait(). A ready
+ * epitem is linked at most once, so epoll records readiness, not a count
+ * of every wakeup. See Documentation/filesystems/epoll-kqueue-study.rst
+ * for a guided walkthrough and a comparison with BSD kqueue.
+ *
+ *
  * Locking
  * -------
  *
@@ -1471,6 +1502,18 @@ static struct epitem *ep_find(struct eventpoll *ep, struct epoll_key *tf)
  * This is the callback that is passed to the wait queue wakeup
  * mechanism. It is called by the stored file descriptors when they
  * have events to report.
+ *
+ * Readiness notification path.
+ *
+ * ep_insert() calls the target file's ->poll() with
+ * ep_ptable_queue_proc(), which installs this callback on each wait queue
+ * selected by that file. A later wake_up() invokes us in the producer's
+ * context, possibly from hard IRQ context, so this path must not sleep.
+ *
+ * Matching notifications add @epi to rdllist once. If epoll_wait() is
+ * scanning rdllist without ep->lock, they go to ovflist instead and are
+ * merged by ep_done_scan(). Finally, wake epoll_wait() callers on ep->wq
+ * and any outer poll/epoll instance waiting on ep->poll_wait.
  */
 static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, void *key)
 {
@@ -1589,6 +1632,14 @@ out_unlock:
 /*
  * This is the callback that is used to add our wait queue to the
  * target file wakeup lists.
+ *
+ * Registration half of the notification path.
+ *
+ * A target file calls poll_wait() from its ->poll() implementation.
+ * poll_wait() dispatches here through poll_table::_qproc, creating one
+ * eppoll_entry for each target wait queue. The entry connects that wait
+ * queue back to the epitem, and ep_poll_callback() is its wake function.
+ * This is why epoll_wait() does not have to rescan every watched file.
  */
 static void ep_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 				 poll_table *pt)
@@ -2233,6 +2284,12 @@ static int ep_schedule_timeout(ktime_t *to)
  *           until at least one event has been retrieved (or an error
  *           occurred).
  *
+ * The loop first tries the ready list, optionally busy-polls a NAPI source,
+ * then joins ep->wq and sleeps. The last readiness check and wait-queue
+ * insertion are both done under ep->lock, the same lock used by
+ * ep_poll_callback(); this closes the classic "event arrived just before
+ * sleep" lost-wakeup window.
+ *
  * Return: the number of ready events which have been fetched, or an
  *          error code, in case of error.
  */
@@ -2472,6 +2529,10 @@ static void clear_tfile_check_list(struct ep_ctl_ctx *ctx)
 
 /*
  * Open an eventpoll file descriptor.
+ *
+ * Creation path: allocate one struct eventpoll and expose it as an
+ * anonymous-inode file. The returned fd is therefore both the userspace
+ * handle and a pollable kernel object; file->private_data points to @ep.
  */
 static int do_epoll_create(int flags)
 {
@@ -2618,6 +2679,14 @@ static void ep_ctl_unlock(struct ep_ctl_ctx *ctx, struct eventpoll *ep,
 	}
 }
 
+/*
+ * Control path shared by epoll_ctl() and io_uring's epoll operation.
+ *
+ * ep->rbr is the authoritative interest set: ADD installs a new epitem
+ * and its target wait-queue callbacks, MOD changes the mask and re-polls,
+ * and DEL unregisters callbacks before unlinking the item. Readiness is
+ * tracked separately on rdllist/ovflist by the notification path.
+ */
 int do_epoll_ctl_file(struct file *f, int op, struct epoll_key *tf,
 		      struct epoll_event *epds, bool nonblock)
 {
