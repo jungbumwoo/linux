@@ -1,0 +1,196 @@
+%% SPDX-License-Identifier: GPL-2.0
+%% fs/eventpoll.c lifecycle and readiness delivery sequence
+%%
+%% kqueue note:
+%% Linux does not implement BSD kqueue/kevent.  The API mapping shown in the
+%% first note is conceptual and is not a Linux kernel call path.
+
+sequenceDiagram
+    autonumber
+
+    actor App as Backend application
+    participant VFS as VFS / anonymous inode
+    participant EP as fs/eventpoll.c
+    participant Interest as Interest set<br/>ep->rbr + file->f_ep
+    participant Target as Watched file<br/>f_op->poll()
+    participant TargetWQ as Target wait queue
+    participant Ready as Ready state<br/>rdllist / ovflist
+    participant EpWQ as epoll waiter<br/>ep->wq + scheduler
+
+    Note over App,EP: BSD API comparison only<br/>kqueue() ~ epoll_create1()<br/>kevent(change list) ~ epoll_ctl()<br/>kevent(event list) ~ epoll_wait()<br/>EV_CLEAR ~ EPOLLET (not identical)<br/>EV_ONESHOT ~ EPOLLONESHOT
+
+    rect rgb(236, 246, 255)
+        Note over App,VFS: 1. Create an epoll instance
+        App->>EP: epoll_create1(flags)
+        EP->>EP: do_epoll_create(flags)
+        EP->>EP: ep_alloc(&ep)
+        Note right of EP: Initialize ep->mtx, ep->lock,<br/>wq, poll_wait, rdllist, rbr,<br/>ovflist and refcount
+        EP->>VFS: anon_inode_getfile("[eventpoll]", eventpoll_fops, ep)
+        VFS-->>EP: struct file<br/>private_data = ep
+        EP->>VFS: fd_publish(fdf)
+        VFS-->>App: epfd
+    end
+
+    rect rgb(241, 255, 241)
+        Note over App,TargetWQ: 2. EPOLL_CTL_ADD - build the interest and notification paths
+        App->>EP: epoll_ctl(epfd, EPOLL_CTL_ADD, fd, event)
+        EP->>EP: do_epoll_ctl()
+        EP->>EP: do_epoll_ctl_file()
+        EP->>EP: ep_ctl_lock()
+
+        opt The target is an epoll file or a full topology check is needed
+            EP->>EP: ep_loop_check()
+            Note right of EP: Reject cycles or chains deeper<br/>than EP_MAX_NESTS
+        end
+
+        EP->>Interest: ep_find(ep, key)
+        Interest-->>EP: no existing epitem
+        EP->>EP: ep_insert()
+        EP->>EP: ep_alloc_epitem()
+        Note right of EP: Allocate one epitem for<br/>(watched file, fd)
+        EP->>Interest: ep_register_epitem()
+        Note over EP,Interest: ep_attach_file() links file->f_ep<br/>ep_rbtree_insert() links ep->rbr
+
+        opt A full path-amplification check is needed
+            EP->>EP: reverse_path_check()
+            Note right of EP: Reject excessive reverse<br/>wakeup paths
+        end
+
+        EP->>Target: ep_item_poll(epi, poll_table)
+        Target->>Target: vfs_poll() -> f_op->poll()
+        Target->>TargetWQ: poll_wait(file, whead, poll_table)
+        TargetWQ->>EP: ep_ptable_queue_proc()
+        EP-->>TargetWQ: Install eppoll_entry.wait<br/>wake function = ep_poll_callback()
+        Target-->>EP: current revents
+
+        opt The target is already ready
+            EP->>Ready: list_add_tail(epi, rdllist)
+            EP->>EpWQ: wake_up(ep->wq)
+        end
+
+        EP->>EP: ep_ctl_unlock()
+        EP-->>App: 0
+    end
+
+    rect rgb(255, 249, 230)
+        Note over App,EpWQ: 3. epoll_wait() - check, join the wait queue, and sleep
+        App->>EP: epoll_wait(epfd, events, maxevents, timeout)
+        EP->>EP: do_epoll_wait()
+        EP->>EP: ep_poll()
+        EP->>Ready: ep_events_available()
+        Ready-->>EP: no ready event
+        EP->>EP: ep_busy_loop() (optional NAPI busy poll)
+
+        Note over EP,EpWQ: ep->lock protects the final readiness check<br/>and wait-queue insertion as one transition
+        EP->>Ready: final ep_events_available() under ep->lock
+        Ready-->>EP: still empty
+        EP->>EpWQ: __add_wait_queue_exclusive(current)
+        EP->>EpWQ: schedule_hrtimeout_range()
+        Note right of EpWQ: The calling task sleeps.<br/>The shared ep->lock closes<br/>the lost-wakeup window.
+    end
+
+    rect rgb(255, 239, 239)
+        Note over Target,EpWQ: 4. Producer-side readiness notification
+        Target->>TargetWQ: wake_up(pollflags)
+        TargetWQ->>EP: ep_poll_callback(wait, key)
+        Note right of EP: Runs in the producer context<br/>and may run in hard IRQ context
+        EP->>EP: Match pollflags with epi->event.events
+
+        alt epoll_wait() is not scanning
+            EP->>Ready: Add epi once to rdllist
+        else epoll_wait() is scanning without ep->lock
+            EP->>Ready: Add epi once to ovflist
+        end
+
+        EP->>EpWQ: wake_up(ep->wq)
+        opt This epoll fd is watched by an outer poll/epoll
+            EP->>EP: ep_poll_safewake(ep->poll_wait)
+        end
+        EpWQ-->>EP: resume ep_poll()
+    end
+
+    rect rgb(245, 240, 255)
+        Note over App,Ready: 5. Harvest and deliver ready events
+        EP->>EP: ep_try_send_events()
+        EP->>EP: ep_send_events()
+        Note right of EP: Hold ep->mtx while scanning<br/>and copying events to userspace
+        EP->>Ready: ep_start_scan()
+        Note over EP,Ready: Splice rdllist into private scan_batch<br/>and enter scan mode so callbacks use ovflist
+
+        loop Each epitem until maxevents
+            EP->>EP: ep_deliver_event()
+            EP->>Target: ep_item_poll(epi, no registration callback)
+            Target->>Target: vfs_poll() -> f_op->poll()
+            Target-->>EP: current revents
+
+            alt No requested readiness remains
+                EP->>Ready: Leave epi off the ready list
+            else copy_to_user() fails
+                EP->>Ready: Return epi to scan_batch
+            else An event is copied
+                EP-->>App: epoll_put_uevent(revents, event.data)
+
+                alt EPOLLONESHOT
+                    EP->>EP: Clear public event bits
+                    Note right of EP: Disabled until<br/>EPOLL_CTL_MOD rearms it
+                else EPOLLET
+                    EP->>Ready: Do not requeue epi
+                    Note right of Ready: Userspace must drain<br/>the fd until EAGAIN
+                else Level-triggered
+                    EP->>Ready: Requeue epi at rdllist tail
+                end
+            end
+        end
+
+        EP->>Ready: ep_done_scan()
+        Note over EP,Ready: Merge ovflist and any unconsumed scan_batch<br/>then return callbacks to normal rdllist mode
+        EP-->>App: number of delivered events
+    end
+
+    rect rgb(238, 252, 252)
+        Note over App,Ready: 6. EPOLL_CTL_MOD - change mask and recheck readiness
+        App->>EP: epoll_ctl(epfd, EPOLL_CTL_MOD, fd, event)
+        EP->>EP: do_epoll_ctl_file()
+        EP->>Interest: ep_find(ep, key)
+        Interest-->>EP: existing epitem
+        EP->>EP: ep_modify()
+        Note right of EP: Publish the new mask and data,<br/>then execute smp_mb()
+        EP->>Target: ep_item_poll()
+        Target-->>EP: current revents
+        opt The item is ready and not already linked
+            EP->>Ready: Add epi to rdllist
+            EP->>EpWQ: wake_up(ep->wq)
+        end
+        EP-->>App: 0
+    end
+
+    rect rgb(248, 248, 248)
+        Note over App,TargetWQ: 7. EPOLL_CTL_DEL and close cleanup
+        alt Explicit EPOLL_CTL_DEL
+            App->>EP: epoll_ctl(epfd, EPOLL_CTL_DEL, fd)
+            EP->>EP: do_epoll_ctl_file()
+            EP->>Interest: ep_find(ep, key)
+            Interest-->>EP: existing epitem
+            EP->>EP: ep_remove()
+            EP->>TargetWQ: ep_unregister_pollwait()
+            EP->>Interest: ep_remove_file() + ep_remove_epi()
+            Note over EP,Interest: Remove file->f_ep, rbr and ready links<br/>then defer epitem free with kfree_rcu()
+            EP-->>App: 0
+        else The watched file's final reference is closed
+            App->>VFS: close(watched fd)
+            VFS->>VFS: __fput(file)
+            VFS->>EP: eventpoll_release(file)
+            EP->>EP: eventpoll_release_file()
+            EP->>TargetWQ: ep_unregister_pollwait()
+            EP->>Interest: Remove this file from every watching epoll
+        else The epoll fd itself is closed
+            App->>VFS: close(epfd)
+            VFS->>EP: ep_eventpoll_release()
+            EP->>EP: ep_clear_and_put()
+            EP->>TargetWQ: ep_drain_pollwaits()
+            EP->>Interest: ep_drain_tree()
+            EP->>EP: ep_put() -> ep_free() when last reference
+        end
+    end
+
+    Note over App,EP: Readiness is coalesced: an epitem is linked at most once.<br/>epoll is a readiness set, not a counter of every wake_up().
