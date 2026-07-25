@@ -1,57 +1,57 @@
 %% SPDX-License-Identifier: GPL-2.0
-%% fs/eventpoll.c lifecycle and readiness delivery sequence
+%% fs/eventpoll.c 생명주기와 readiness 전달 흐름
 %%
-%% kqueue note:
-%% Linux does not implement BSD kqueue/kevent.  The API mapping shown in the
-%% first note is conceptual and is not a Linux kernel call path.
+%% kqueue 주의사항:
+%% Linux는 BSD kqueue/kevent를 구현하지 않는다. 첫 번째 노트의 API 대응은
+%% 개념적인 비교이며 Linux 커널 내부 호출 경로가 아니다.
 
 sequenceDiagram
     autonumber
 
-    actor App as Backend application
+    actor App as 백엔드 애플리케이션
     participant VFS as VFS / anonymous inode
     participant EP as fs/eventpoll.c
-    participant Interest as Interest set<br/>ep->rbr + file->f_ep
-    participant Target as Watched file<br/>f_op->poll()
-    participant TargetWQ as Target wait queue
-    participant Ready as Ready state<br/>rdllist / ovflist
-    participant EpWQ as epoll waiter<br/>ep->wq + scheduler
+    participant Interest as 관심 목록(Interest set)<br/>ep->rbr + file->f_ep
+    participant Target as 감시 대상 파일<br/>f_op->poll()
+    participant TargetWQ as 대상 파일의 wait queue
+    participant Ready as 준비 목록(Ready state)<br/>rdllist / ovflist
+    participant EpWQ as epoll 대기자<br/>ep->wq + scheduler
 
-    Note over App,EP: BSD API comparison only<br/>kqueue() ~ epoll_create1()<br/>kevent(change list) ~ epoll_ctl()<br/>kevent(event list) ~ epoll_wait()<br/>EV_CLEAR ~ EPOLLET (not identical)<br/>EV_ONESHOT ~ EPOLLONESHOT
+    Note over App,EP: BSD API와의 개념 비교<br/>kqueue() ~ epoll_create1()<br/>kevent(change list) ~ epoll_ctl()<br/>kevent(event list) ~ epoll_wait()<br/>EV_CLEAR ~ EPOLLET (완전히 같지는 않음)<br/>EV_ONESHOT ~ EPOLLONESHOT
 
     rect rgb(236, 246, 255)
-        Note over App,VFS: 1. Create an epoll instance
+        Note over App,VFS: 1. epoll 인스턴스 생성
         App->>EP: epoll_create1(flags)
         EP->>EP: do_epoll_create(flags)
         EP->>EP: ep_alloc(&ep)
-        Note right of EP: Initialize ep->mtx, ep->lock,<br/>wq, poll_wait, rdllist, rbr,<br/>ovflist and refcount
+        Note right of EP: ep->mtx, ep->lock, wq, poll_wait,<br/>rdllist, rbr, ovflist, refcount를<br/>초기화한다.
         EP->>VFS: anon_inode_getfile("[eventpoll]", eventpoll_fops, ep)
         VFS-->>EP: struct file<br/>private_data = ep
         EP->>VFS: fd_publish(fdf)
-        VFS-->>App: epfd
+        VFS-->>App: epfd 반환
     end
 
     rect rgb(241, 255, 241)
-        Note over App,TargetWQ: 2. EPOLL_CTL_ADD - build the interest and notification paths
+        Note over App,TargetWQ: 2. EPOLL_CTL_ADD - 관심 목록과 알림 경로 구성
         App->>EP: epoll_ctl(epfd, EPOLL_CTL_ADD, fd, event)
         EP->>EP: do_epoll_ctl()
         EP->>EP: do_epoll_ctl_file()
         EP->>EP: ep_ctl_lock()
 
-        opt The target is an epoll file or a full topology check is needed
+        opt 대상이 epoll 파일이거나 전체 topology 검사가 필요한 경우
             EP->>EP: ep_loop_check()
             Note right of EP: Reject cycles or chains deeper<br/>than EP_MAX_NESTS
         end
 
         EP->>Interest: ep_find(ep, key)
-        Interest-->>EP: no existing epitem
+        Interest-->>EP: 기존 epitem 없음
         EP->>EP: ep_insert()
         EP->>EP: ep_alloc_epitem()
-        Note right of EP: Allocate one epitem for<br/>(watched file, fd)
+        Note right of EP: (감시 대상 file, fd) 등록 하나당<br/>epitem 하나를 할당한다.
         EP->>Interest: ep_register_epitem()
-        Note over EP,Interest: ep_attach_file() links file->f_ep<br/>ep_rbtree_insert() links ep->rbr
+        Note over EP,Interest: ep_attach_file()은 file->f_ep에 연결하고<br/>ep_rbtree_insert()는 ep->rbr에 연결한다.
 
-        opt A full path-amplification check is needed
+        opt 전체 wakeup 경로 증폭 검사가 필요한 경우
             EP->>EP: reverse_path_check()
             Note right of EP: Reject excessive reverse<br/>wakeup paths
         end
@@ -60,10 +60,10 @@ sequenceDiagram
         Target->>Target: vfs_poll() -> f_op->poll()
         Target->>TargetWQ: poll_wait(file, whead, poll_table)
         TargetWQ->>EP: ep_ptable_queue_proc()
-        EP-->>TargetWQ: Install eppoll_entry.wait<br/>wake function = ep_poll_callback()
-        Target-->>EP: current revents
+        EP-->>TargetWQ: eppoll_entry.wait 설치<br/>wake 함수 = ep_poll_callback()
+        Target-->>EP: 현재 revents
 
-        opt The target is already ready
+        opt 등록 시점에 대상이 이미 ready인 경우
             EP->>Ready: list_add_tail(epi, rdllist)
             EP->>EpWQ: wake_up(ep->wq)
         end
@@ -78,119 +78,119 @@ sequenceDiagram
         EP->>EP: do_epoll_wait()
         EP->>EP: ep_poll()
         EP->>Ready: ep_events_available()
-        Ready-->>EP: no ready event
-        EP->>EP: ep_busy_loop() (optional NAPI busy poll)
+        Ready-->>EP: ready event 없음
+        EP->>EP: ep_busy_loop() (선택적 NAPI busy poll)
 
-        Note over EP,EpWQ: ep->lock protects the final readiness check<br/>and wait-queue insertion as one transition
-        EP->>Ready: final ep_events_available() under ep->lock
-        Ready-->>EP: still empty
+        Note over EP,EpWQ: 마지막 readiness 확인과 wait queue 삽입을<br/>동일한 ep->lock 임계 구역에서 수행한다.
+        EP->>Ready: ep->lock 아래에서 마지막 ep_events_available()
+        Ready-->>EP: 여전히 비어 있음
         EP->>EpWQ: __add_wait_queue_exclusive(current)
         EP->>EpWQ: schedule_hrtimeout_range()
-        Note right of EpWQ: The calling task sleeps.<br/>The shared ep->lock closes<br/>the lost-wakeup window.
+        Note right of EpWQ: 호출 task가 sleep한다.<br/>callback과 공유하는 ep->lock이<br/>lost wakeup 구간을 닫는다.
     end
 
     rect rgb(255, 239, 239)
-        Note over Target,EpWQ: 4. Producer-side readiness notification
+        Note over Target,EpWQ: 4. Producer 측 readiness 알림
         Target->>TargetWQ: wake_up(pollflags)
         TargetWQ->>EP: ep_poll_callback(wait, key)
-        Note right of EP: Runs in the producer context<br/>and may run in hard IRQ context
-        EP->>EP: Match pollflags with epi->event.events
+        Note right of EP: 이벤트를 만든 producer 문맥에서 실행되며<br/>hard IRQ 문맥에서도 호출될 수 있다.
+        EP->>EP: pollflags와 epi->event.events 비교
 
-        alt epoll_wait() is not scanning
-            EP->>Ready: Add epi once to rdllist
-        else epoll_wait() is scanning without ep->lock
-            EP->>Ready: Add epi once to ovflist
+        alt epoll_wait()이 ready list를 scan 중이 아님
+            EP->>Ready: epi를 rdllist에 한 번만 추가
+        else epoll_wait()이 ep->lock 없이 scan 중
+            EP->>Ready: epi를 ovflist에 한 번만 추가
         end
 
         EP->>EpWQ: wake_up(ep->wq)
-        opt This epoll fd is watched by an outer poll/epoll
+        opt 이 epoll fd를 바깥 poll/epoll이 감시하는 경우
             EP->>EP: ep_poll_safewake(ep->poll_wait)
         end
-        EpWQ-->>EP: resume ep_poll()
+        EpWQ-->>EP: ep_poll() 재개
     end
 
     rect rgb(245, 240, 255)
-        Note over App,Ready: 5. Harvest and deliver ready events
+        Note over App,Ready: 5. ready event 수집 및 userspace 전달
         EP->>EP: ep_try_send_events()
         EP->>EP: ep_send_events()
-        Note right of EP: Hold ep->mtx while scanning<br/>and copying events to userspace
+        Note right of EP: scan 및 userspace 복사 중에는<br/>ep->mtx를 유지한다.
         EP->>Ready: ep_start_scan()
-        Note over EP,Ready: Splice rdllist into private scan_batch<br/>and enter scan mode so callbacks use ovflist
+        Note over EP,Ready: rdllist를 호출자 전용 scan_batch로 옮긴다.<br/>scan 중 callback은 ovflist를 사용한다.
 
-        loop Each epitem until maxevents
+        loop maxevents에 도달할 때까지 각 epitem 처리
             EP->>EP: ep_deliver_event()
-            EP->>Target: ep_item_poll(epi, no registration callback)
+            EP->>Target: ep_item_poll(epi, 등록 callback 없음)
             Target->>Target: vfs_poll() -> f_op->poll()
-            Target-->>EP: current revents
+            Target-->>EP: 현재 revents
 
-            alt No requested readiness remains
-                EP->>Ready: Leave epi off the ready list
-            else copy_to_user() fails
-                EP->>Ready: Return epi to scan_batch
-            else An event is copied
+            alt 요청한 readiness가 더 이상 없음
+                EP->>Ready: epi를 ready list에서 제외
+            else copy_to_user() 실패
+                EP->>Ready: epi를 scan_batch에 되돌림
+            else event 복사 성공
                 EP-->>App: epoll_put_uevent(revents, event.data)
 
                 alt EPOLLONESHOT
-                    EP->>EP: Clear public event bits
-                    Note right of EP: Disabled until<br/>EPOLL_CTL_MOD rearms it
+                    EP->>EP: 공개 event bit 제거
+                    Note right of EP: EPOLL_CTL_MOD로 rearm할 때까지<br/>해당 등록은 비활성화된다.
                 else EPOLLET
-                    EP->>Ready: Do not requeue epi
-                    Note right of Ready: Userspace must drain<br/>the fd until EAGAIN
-                else Level-triggered
-                    EP->>Ready: Requeue epi at rdllist tail
+                    EP->>Ready: epi를 자동으로 재등록하지 않음
+                    Note right of Ready: userspace는 EAGAIN이 나올 때까지<br/>fd의 데이터를 drain해야 한다.
+                else Level-triggered(LT)
+                    EP->>Ready: epi를 rdllist 끝에 다시 연결
                 end
             end
         end
 
         EP->>Ready: ep_done_scan()
-        Note over EP,Ready: Merge ovflist and any unconsumed scan_batch<br/>then return callbacks to normal rdllist mode
-        EP-->>App: number of delivered events
+        Note over EP,Ready: ovflist와 미처리 scan_batch를 병합하고<br/>callback이 다시 rdllist를 사용하도록 전환한다.
+        EP-->>App: 전달된 event 개수
     end
 
     rect rgb(238, 252, 252)
-        Note over App,Ready: 6. EPOLL_CTL_MOD - change mask and recheck readiness
+        Note over App,Ready: 6. EPOLL_CTL_MOD - 관심 mask 변경 및 readiness 재확인
         App->>EP: epoll_ctl(epfd, EPOLL_CTL_MOD, fd, event)
         EP->>EP: do_epoll_ctl_file()
         EP->>Interest: ep_find(ep, key)
-        Interest-->>EP: existing epitem
+        Interest-->>EP: 기존 epitem
         EP->>EP: ep_modify()
-        Note right of EP: Publish the new mask and data,<br/>then execute smp_mb()
+        Note right of EP: 새 mask와 data를 먼저 게시한 뒤<br/>smp_mb()를 실행한다.
         EP->>Target: ep_item_poll()
-        Target-->>EP: current revents
-        opt The item is ready and not already linked
-            EP->>Ready: Add epi to rdllist
+        Target-->>EP: 현재 revents
+        opt ready 상태이고 아직 ready list에 없는 경우
+            EP->>Ready: epi를 rdllist에 추가
             EP->>EpWQ: wake_up(ep->wq)
         end
         EP-->>App: 0
     end
 
     rect rgb(248, 248, 248)
-        Note over App,TargetWQ: 7. EPOLL_CTL_DEL and close cleanup
-        alt Explicit EPOLL_CTL_DEL
+        Note over App,TargetWQ: 7. EPOLL_CTL_DEL 및 close 정리 경로
+        alt 명시적인 EPOLL_CTL_DEL
             App->>EP: epoll_ctl(epfd, EPOLL_CTL_DEL, fd)
             EP->>EP: do_epoll_ctl_file()
             EP->>Interest: ep_find(ep, key)
-            Interest-->>EP: existing epitem
+            Interest-->>EP: 기존 epitem
             EP->>EP: ep_remove()
             EP->>TargetWQ: ep_unregister_pollwait()
             EP->>Interest: ep_remove_file() + ep_remove_epi()
-            Note over EP,Interest: Remove file->f_ep, rbr and ready links<br/>then defer epitem free with kfree_rcu()
+            Note over EP,Interest: file->f_ep, rbr, ready link를 제거하고<br/>kfree_rcu()로 epitem 해제를 지연한다.
             EP-->>App: 0
-        else The watched file's final reference is closed
-            App->>VFS: close(watched fd)
+        else 감시 대상 파일의 마지막 reference가 close됨
+            App->>VFS: close(감시 대상 fd)
             VFS->>VFS: __fput(file)
             VFS->>EP: eventpoll_release(file)
             EP->>EP: eventpoll_release_file()
             EP->>TargetWQ: ep_unregister_pollwait()
-            EP->>Interest: Remove this file from every watching epoll
-        else The epoll fd itself is closed
+            EP->>Interest: 이 파일을 감시하던 모든 epoll에서 제거
+        else epoll fd 자체가 close됨
             App->>VFS: close(epfd)
             VFS->>EP: ep_eventpoll_release()
             EP->>EP: ep_clear_and_put()
             EP->>TargetWQ: ep_drain_pollwaits()
             EP->>Interest: ep_drain_tree()
-            EP->>EP: ep_put() -> ep_free() when last reference
+            EP->>EP: 마지막 reference이면 ep_put() -> ep_free()
         end
     end
 
-    Note over App,EP: Readiness is coalesced: an epitem is linked at most once.<br/>epoll is a readiness set, not a counter of every wake_up().
+    Note over App,EP: 같은 epitem의 readiness는 하나로 합쳐져 한 번만 연결된다.<br/>epoll은 모든 wake_up() 횟수를 세는 큐가 아니라 readiness set이다.
